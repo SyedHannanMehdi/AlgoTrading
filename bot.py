@@ -194,8 +194,9 @@ def webhook():
     if not data:
         return jsonify({"error": "empty body"}), 400
 
-    # ── Auth
-    if data.get("secret") != WEBHOOK_SECRET:
+    # ── Auth — secret comes from the webhook URL query param: /webhook?secret=...
+    url_secret = request.args.get("secret", "")
+    if url_secret != WEBHOOK_SECRET:
         return jsonify({"error": "unauthorized"}), 401
 
     # ── Parse payload
