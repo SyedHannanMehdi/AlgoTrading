@@ -70,9 +70,9 @@ def b_post(path: str, params: dict) -> dict:
 
 # ─── ACCOUNT BALANCE ─────────────────────────────────────────────────────────
 def get_balance() -> float:
-    """GET /fapi/v2/balance → available USDT"""
+    """GET /fapi/v3/balance → available USDT"""
     try:
-        resp = b_get("/fapi/v2/balance")
+        resp = b_get("/fapi/v3/balance")
         for asset in (resp if isinstance(resp, list) else []):
             if asset.get("asset") == "USDT":
                 bal = float(asset.get("availableBalance", 0))
@@ -86,9 +86,9 @@ def get_balance() -> float:
 
 # ─── OPEN POSITIONS ───────────────────────────────────────────────────────────
 def get_open_positions() -> list:
-    """GET /fapi/v2/positionRisk → non-zero positions"""
+    """GET /fapi/v3/positionRisk → non-zero positions"""
     try:
-        resp = b_get("/fapi/v2/positionRisk")
+        resp = b_get("/fapi/v3/positionRisk")
         return [p for p in (resp if isinstance(resp, list) else [])
                 if float(p.get("positionAmt", 0)) != 0]
     except Exception as e:
@@ -280,7 +280,11 @@ def health():
 def debug():
     """Returns raw Binance responses — no processing, shows exact errors."""
     results = {}
-    for label, path in [("balance", "/fapi/v2/balance"), ("account", "/fapi/v2/account")]:
+    for label, path in [
+        ("balance",   "/fapi/v3/balance"),
+        ("account",   "/fapi/v3/account"),
+        ("positions", "/fapi/v3/positionRisk"),
+    ]:
         try:
             results[label] = b_get(path)
         except Exception as e:
