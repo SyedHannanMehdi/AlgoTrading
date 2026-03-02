@@ -243,20 +243,19 @@ def health():
 # ─── DEBUG ────────────────────────────────────────────────────────────────────
 @app.route("/debug", methods=["GET"])
 def debug():
-    try:
-        balance = b_get("/fapi/v2/balance")
-        account = b_get("/fapi/v2/account")
-        return jsonify({
-            "canTrade": account.get("canTrade"),
-            "balance":  [a for a in balance if a.get("asset") == "USDT"],
-        }), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    """Returns raw Binance responses — no processing, shows exact errors."""
+    results = {}
+    for label, path in [("balance", "/fapi/v2/balance"), ("account", "/fapi/v2/account")]:
+        try:
+            results[label] = b_get(path)
+        except Exception as e:
+            results[label] = {"exception": str(e)}
+    return jsonify(results), 200
 
 @app.route("/myip", methods=["GET"])
 def myip():
     r = requests.get("https://api.ipify.org?format=json", timeout=5)
     return jsonify(r.json())
-
+    
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
