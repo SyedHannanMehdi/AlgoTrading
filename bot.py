@@ -1,99 +1,84 @@
 import time
 import hmac
 import hashlib
-import base64
-import json
 import math
 import os
 import uuid
+import json
 import requests
 from urllib.parse import urlencode
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ─── CONFIG — set all of these as environment variables in Railway ─────────────
-API_KEY         = os.environ.get("WEEX_API_KEY",    "")
-SECRET_KEY      = os.environ.get("WEEX_SECRET_KEY", "")
-PASSPHRASE      = os.environ.get("WEEX_PASSPHRASE", "")
-WEBHOOK_SECRET  = os.environ.get("WEBHOOK_SECRET",  "")
+# ─── CONFIG — set these as environment variables in Railway ───────────────────
+API_KEY        = os.environ.get("BINANCE_API_KEY",    "")
+SECRET_KEY     = os.environ.get("BINANCE_SECRET_KEY", "")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET",     "")
 
 MARGIN_PCT      = float(os.environ.get("MARGIN_PCT",      "0.20"))
 LEVERAGE        = int(os.environ.get("LEVERAGE",          "10"))
 MAX_OPEN_TRADES = int(os.environ.get("MAX_OPEN_TRADES",   "5"))
 
-BASE_URL = "https://api-contract.weex.com"
+BASE_URL = "https://fapi.binance.com"  # USDM Futures
 
-# ─── SYMBOL MAP — TradingView ticker → WEEX futures symbol ───────────────────
+# ─── SYMBOL MAP — TradingView ticker → Binance USDM symbol ───────────────────
 SYMBOL_MAP = {
-    "GUNUSD":      "cmt_gunusdt",
-    "PIPPINUSD":   "cmt_pippinusdt",
-    "RIVERUSD":    "cmt_riverusdt",
-    "VVVUSD":      "cmt_vvvusdt",
-    "MOGUSD":      "cmt_mogusdt",
-    "USUALUSD":    "cmt_usualusdt",
-    "BROCCOLIUSD": "cmt_broccoliusdt",
-    "SPX6USD":     "cmt_spx6900usdt",
-    "RESOLVUSD":   "cmt_resolveusdt",
-    "API3USD":     "cmt_api3usdt",
-    "BIOUSDT":     "cmt_biousdt",
-    "THEUSDT":     "cmt_theusdt",
-    "PENGUUSDT":   "cmt_penguusdt",
-    "AEROUSDT":    "cmt_aerousdt",
-    "PUMPUSDT":    "cmt_pumpusdt",
+    # Crypto.com feed → Binance equivalent
+    "GUNUSD":      "GUNUSDT",
+    "PIPPINUSD":   "PIPPINUSDT",
+    "RIVERUSD":    "RIVERUSDT",
+    "VVVUSD":      "VVVUSDT",
+    "MOGUSD":      "MOGUSDT",
+    "USUALUSD":    "USUALUSDT",
+    "BROCCOLIUSD": "BROCCOLIUSDT",
+    "SPX6USD":     "SPX6900USDT",
+    "RESOLVUSD":   "RESOLVEUSDT",
+    "API3USD":     "API3USDT",
+    # Binance feed — already correct
+    "BIOUSDT":     "BIOUSDT",
+    "THEUSDT":     "THEUSDT",
+    "PENGUUSDT":   "PENGUUSDT",
+    "AEROUSDT":    "AEROUSDT",
+    "PUMPUSDT":    "PUMPUSDT",
 }
 
 # ─── SIGNATURE ────────────────────────────────────────────────────────────────
-# WEEX format: BASE64( HMAC-SHA256( timestamp + METHOD + path + query_string + body ) )
-# query_string includes the "?" prefix when present, body is "" for GET
+# Binance: HMAC-SHA256 over the full query string including timestamp
+def _sign(params: dict) -> dict:
+    params["timestamp"] = int(time.time() * 1000)
+    query_string = urlencode(params)
+    params["signature"] = hmac.new(
+        SECRET_KEY.encode("utf-8"),
+        query_string.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+    return params
 
-def _sign(timestamp: str, method: str, path: str, query_string: str = "", body: str = "") -> str:
-    message = timestamp + method.upper() + path + query_string + body
-    digest  = hmac.new(SECRET_KEY.encode(), message.encode(), hashlib.sha256).digest()
-    return base64.b64encode(digest).decode()
+def _headers() -> dict:
+    return {"X-MBX-APIKEY": API_KEY}
 
-def _headers(method: str, path: str, query_string: str = "", body: str = "") -> dict:
-    ts = str(int(time.time() * 1000))
-    return {
-        "ACCESS-KEY":        API_KEY,
-        "ACCESS-SIGN":       _sign(ts, method, path, query_string, body),
-        "ACCESS-TIMESTAMP":  ts,
-        "ACCESS-PASSPHRASE": PASSPHRASE,
-        "Content-Type":      "application/json",
-        "locale":            "en-US",
-    }
-
-def weex_get(path: str, params: dict = None) -> dict:
-    query_string = ("?" + urlencode(params)) if params else ""
-    url = BASE_URL + path + query_string
-    r = requests.get(url, headers=_headers("GET", path, query_string), timeout=10)
+def b_get(path: str, params: dict = None) -> dict:
+    r = requests.get(BASE_URL + path, headers=_headers(),
+                     params=_sign(params or {}), timeout=10)
     return r.json()
 
-def weex_post(path: str, body: dict) -> dict:
-    body_str = json.dumps(body)
-    r = requests.post(
-        BASE_URL + path,
-        headers=_headers("POST", path, "", body_str),
-        data=body_str,
-        timeout=10
-    )
+def b_post(path: str, params: dict) -> dict:
+    r = requests.post(BASE_URL + path, headers=_headers(),
+                      params=_sign(params), timeout=10)
     return r.json()
 
-# ─── ACCOUNT EQUITY ───────────────────────────────────────────────────────────
-def get_account_equity() -> float:
-    """
-    GET /capi/v2/account/getAccounts
-    Returns the USDT collateral `amount` (available balance).
-    """
+# ─── ACCOUNT BALANCE ─────────────────────────────────────────────────────────
+def get_balance() -> float:
+    """GET /fapi/v2/balance → available USDT"""
     try:
-        resp = weex_get("/capi/v2/account/getAccounts")
-        collateral = resp.get("collateral", [])
-        for item in collateral:
-            if item.get("coin", "").upper() == "USDT":
-                equity = float(item.get("amount", 0))
-                print(f"[ACCOUNT] Live equity: ${equity:.2f}")
-                return equity
-        print(f"[ACCOUNT] USDT collateral not found. Full response: {resp}")
+        resp = b_get("/fapi/v2/balance")
+        for asset in (resp if isinstance(resp, list) else []):
+            if asset.get("asset") == "USDT":
+                bal = float(asset.get("availableBalance", 0))
+                print(f"[ACCOUNT] Balance: ${bal:.2f}")
+                return bal
+        print(f"[ACCOUNT] Unexpected: {resp}")
         return 0.0
     except Exception as e:
         print(f"[ACCOUNT] Error: {e}")
@@ -101,18 +86,11 @@ def get_account_equity() -> float:
 
 # ─── OPEN POSITIONS ───────────────────────────────────────────────────────────
 def get_open_positions() -> list:
-    """
-    GET /capi/v2/account/getAccounts → account.modeSetting gives us symbols with positions.
-    But for actual position list we use the positions endpoint.
-    """
+    """GET /fapi/v2/positionRisk → non-zero positions"""
     try:
-        resp = weex_get("/capi/v2/mix/position/allPosition")
-        data = resp.get("data", [])
-        if not isinstance(data, list):
-            print(f"[POSITIONS] Unexpected response: {resp}")
-            return []
-        open_pos = [p for p in data if float(p.get("total", 0)) != 0]
-        return open_pos
+        resp = b_get("/fapi/v2/positionRisk")
+        return [p for p in (resp if isinstance(resp, list) else [])
+                if float(p.get("positionAmt", 0)) != 0]
     except Exception as e:
         print(f"[POSITIONS] Error: {e}")
         return []
@@ -120,55 +98,67 @@ def get_open_positions() -> list:
 # ─── LEVERAGE & MARGIN MODE ───────────────────────────────────────────────────
 def set_leverage_isolated(symbol: str):
     try:
-        r1 = weex_post("/capi/v2/account/setLeverage", {
-            "symbol":   symbol,
-            "leverage": str(LEVERAGE),
-            "holdSide": "long_short"
-        })
-        r2 = weex_post("/capi/v2/account/setMarginMode", {
-            "symbol":     symbol,
-            "marginMode": "isolated"
-        })
-        print(f"[LEVERAGE] {symbol} {LEVERAGE}x isolated | {r1.get('msg')} | {r2.get('msg')}")
+        r1 = b_post("/fapi/v1/leverage",    {"symbol": symbol, "leverage": LEVERAGE})
+        r2 = b_post("/fapi/v1/marginType",  {"symbol": symbol, "marginType": "ISOLATED"})
+        print(f"[LEVERAGE] {symbol} {LEVERAGE}x isolated | {r1.get('msg','ok')} | {r2.get('msg','ok')}")
     except Exception as e:
         print(f"[LEVERAGE] Error: {e}")
 
-# ─── PLACE ORDER ──────────────────────────────────────────────────────────────
-def place_order(symbol: str, side: str, size: float,
-                tp_price: float = None, sl_price: float = None) -> dict:
+# ─── PLACE MARKET ENTRY ───────────────────────────────────────────────────────
+def place_entry(symbol: str, side: str, qty: float) -> dict:
+    """POST /fapi/v1/order — MARKET, one-way mode (positionSide=BOTH)"""
+    return b_post("/fapi/v1/order", {
+        "symbol":           symbol,
+        "side":             side,       # BUY or SELL
+        "type":             "MARKET",
+        "quantity":         str(qty),
+        "newClientOrderId": uuid.uuid4().hex[:32],
+    })
+
+# ─── PLACE TP + SL (separate orders, post Dec-2025 Binance API) ──────────────
+# STOP_MARKET and TAKE_PROFIT_MARKET now use closePosition=true on /fapi/v1/order
+# The old preset TP/SL on the entry order is no longer supported.
+def place_tp_sl(symbol: str, entry_side: str,
+                tp_price: float, sl_price: float) -> dict:
     """
-    POST /capi/v2/order/placeOrder
-    type: 1=open long, 2=open short, 3=close long, 4=close short
-    order_type: 0=Normal
-    match_price: 1=Market
+    Places TP and SL as separate conditional orders.
+    entry_side BUY  → closing side is SELL
+    entry_side SELL → closing side is BUY
     """
-    order_type_code = "1" if side == "BUY" else "2"   # 1=open long, 2=open short
+    close_side = "SELL" if entry_side == "BUY" else "BUY"
+    results = {}
 
-    body = {
-        "symbol":      symbol,
-        "client_oid":  uuid.uuid4().hex[:32],
-        "size":        str(size),
-        "type":        order_type_code,
-        "order_type":  "0",   # Normal
-        "match_price": "1",   # Market execution
-        "price":       "0",   # Ignored for market orders
-        "marginMode":  3,     # 3 = Isolated
-    }
+    if tp_price > 0:
+        results["tp"] = b_post("/fapi/v1/order", {
+            "symbol":           symbol,
+            "side":             close_side,
+            "type":             "TAKE_PROFIT_MARKET",
+            "stopPrice":        str(round(tp_price, 8)),
+            "closePosition":    "true",
+            "timeInForce":      "GTE_GTC",
+            "newClientOrderId": uuid.uuid4().hex[:32],
+        })
 
-    if tp_price and tp_price > 0:
-        body["presetTakeProfitPrice"] = str(round(tp_price, 8))
-    if sl_price and sl_price > 0:
-        body["presetStopLossPrice"] = str(round(sl_price, 8))
+    if sl_price > 0:
+        results["sl"] = b_post("/fapi/v1/order", {
+            "symbol":           symbol,
+            "side":             close_side,
+            "type":             "STOP_MARKET",
+            "stopPrice":        str(round(sl_price, 8)),
+            "closePosition":    "true",
+            "timeInForce":      "GTE_GTC",
+            "newClientOrderId": uuid.uuid4().hex[:32],
+        })
 
-    return weex_post("/capi/v2/order/placeOrder", body)
+    return results
 
-# ─── POSITION SIZE ────────────────────────────────────────────────────────────
-def calc_size(price: float, equity: float) -> float:
-    """notional = equity × margin% × leverage  →  qty = notional / price"""
-    if price <= 0 or equity <= 0:
+# ─── QUANTITY CALC ────────────────────────────────────────────────────────────
+def calc_qty(price: float, balance: float) -> float:
+    """notional = balance × margin% × leverage → qty = notional / price"""
+    if price <= 0 or balance <= 0:
         return 0.0
-    notional = equity * MARGIN_PCT * LEVERAGE
-    return math.floor((notional / price) * 10) / 10   # round down to 1 decimal
+    notional = balance * MARGIN_PCT * LEVERAGE
+    return math.floor((notional / price) * 10) / 10  # 1 decimal, round down
 
 # ─── WEBHOOK ──────────────────────────────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
@@ -177,7 +167,6 @@ def webhook():
     if not data:
         return jsonify({"error": "empty body"}), 400
 
-    # Auth via URL query param: /webhook?secret=YOUR_SECRET
     if request.args.get("secret") != WEBHOOK_SECRET:
         return jsonify({"error": "unauthorized"}), 401
 
@@ -196,33 +185,28 @@ def webhook():
     if not symbol:
         return jsonify({"error": f"unknown ticker: {ticker}"}), 400
 
-    # Live equity
-    equity = get_account_equity()
-    if equity <= 0:
-        return jsonify({"error": "could not fetch account equity"}), 500
+    balance = get_balance()
+    if balance <= 0:
+        return jsonify({"error": "could not fetch balance"}), 500
 
-    # Max open trades guard
     open_positions = get_open_positions()
     if len(open_positions) >= MAX_OPEN_TRADES:
-        print(f"[SKIP] Max trades reached: {len(open_positions)}/{MAX_OPEN_TRADES}")
+        print(f"[SKIP] Max trades: {len(open_positions)}/{MAX_OPEN_TRADES}")
         return jsonify({"status": "skipped", "reason": "max_open_trades"}), 200
 
-    # No duplicate in same symbol
     open_symbols = [p.get("symbol") for p in open_positions]
     if symbol in open_symbols:
         print(f"[SKIP] Already in {symbol}")
-        return jsonify({"status": "skipped", "reason": "already_open", "symbol": symbol}), 200
+        return jsonify({"status": "skipped", "reason": "already_open"}), 200
 
-    # Set leverage + isolated
     set_leverage_isolated(symbol)
 
-    # Calculate size
-    size = calc_size(price, equity)
-    if size <= 0:
-        return jsonify({"error": "calculated size is zero"}), 400
+    qty = calc_qty(price, balance)
+    if qty <= 0:
+        return jsonify({"error": "quantity is zero — check balance/price"}), 400
 
-    # Place order
-    result = place_order(symbol, side, size, tp_price=tp_price, sl_price=sl_price)
+    entry_result = place_entry(symbol, side, qty)
+    tp_sl_result = place_tp_sl(symbol, side, tp_price, sl_price) if (tp_price > 0 or sl_price > 0) else {}
 
     log = {
         "status":   "ok",
@@ -231,22 +215,24 @@ def webhook():
         "price":    price,
         "tp":       tp_price,
         "sl":       sl_price,
-        "size":     size,
-        "equity":   equity,
-        "notional": round(equity * MARGIN_PCT * LEVERAGE, 2),
-        "result":   result,
+        "qty":      qty,
+        "balance":  balance,
+        "notional": round(balance * MARGIN_PCT * LEVERAGE, 2),
+        "entry":    entry_result,
+        "tp_sl":    tp_sl_result,
     }
     print(f"[ORDER] {json.dumps(log)}")
     return jsonify(log), 200
 
-# ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
+# ─── HEALTH ───────────────────────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
-    equity    = get_account_equity()
+    balance   = get_balance()
     positions = get_open_positions()
     return jsonify({
         "status":      "running",
-        "equity":      equity,
+        "exchange":    "Binance USDM Futures",
+        "balance":     balance,
         "open_trades": len(positions),
         "max_trades":  MAX_OPEN_TRADES,
         "leverage":    LEVERAGE,
@@ -254,15 +240,23 @@ def health():
         "positions":   [p.get("symbol") for p in positions],
     }), 200
 
-# ─── DEBUG (remove after confirming working) ──────────────────────────────────
+# ─── DEBUG ────────────────────────────────────────────────────────────────────
 @app.route("/debug", methods=["GET"])
 def debug():
-    """Raw WEEX account response — use to verify API connectivity."""
     try:
-        resp = weex_get("/capi/v2/account/getAccounts")
-        return jsonify({"raw": resp}), 200
+        balance = b_get("/fapi/v2/balance")
+        account = b_get("/fapi/v2/account")
+        return jsonify({
+            "canTrade": account.get("canTrade"),
+            "balance":  [a for a in balance if a.get("asset") == "USDT"],
+        }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route("/myip", methods=["GET"])
+def myip():
+    r = requests.get("https://api.ipify.org?format=json", timeout=5)
+    return jsonify(r.json())
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
