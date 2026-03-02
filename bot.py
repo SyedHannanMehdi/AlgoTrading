@@ -274,6 +274,14 @@ def health():
         "positions":   [p.get("symbol") for p in positions]
     }), 200
 
-
+@app.route("/debug", methods=["GET"])
+def debug():
+    # Test equity fetch with raw response
+    try:
+        resp = weex_get("/capi/v2/account/accountAssets", {"productType": "umcbl"})
+        return jsonify({"raw_response": resp}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+        
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
