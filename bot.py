@@ -115,9 +115,36 @@ def place_entry(symbol: str, side: str, qty: float) -> dict:
         "newClientOrderId": uuid.uuid4().hex[:32],
     })
 
+# ─── PRICE PRECISION ─────────────────────────────────────────────────────────
+_tick_cache = {}
+
+def get_tick_size(symbol: str) -> float:
+    """Fetch Binance tick size (price precision) for a symbol. Cached."""
+    if symbol in _tick_cache:
+        return _tick_cache[symbol]
+    try:
+        info = requests.get(f"{BASE_URL}/fapi/v1/exchangeInfo", timeout=10).json()
+        for s in info.get("symbols", []):
+            if s["symbol"] == symbol:
+                for f in s.get("filters", []):
+                    if f["filterType"] == "PRICE_FILTER":
+                        tick = float(f["tickSize"])
+                        _tick_cache[symbol] = tick
+                        return tick
+    except Exception as e:
+        print(f"[TICK] Error fetching tick size for {symbol}: {e}")
+    return 0.0001  # safe fallback
+
+def round_price(price: float, tick: float) -> str:
+    """Round price to Binance tick size and return as string."""
+    if tick <= 0:
+        return str(round(price, 4))
+    precision = max(0, round(-math.log10(tick)))
+    rounded = math.floor(price / tick) * tick
+    return f"{rounded:.{int(precision)}f}"
+
 # ─── PLACE TP + SL (separate orders, post Dec-2025 Binance API) ──────────────
-# STOP_MARKET and TAKE_PROFIT_MARKET now use closePosition=true on /fapi/v1/order
-# The old preset TP/SL on the entry order is no longer supported.
+# STOP_MARKET and TAKE_PROFIT_MARKET use closePosition=true + workingType=MARK_PRICE
 def place_tp_sl(symbol: str, entry_side: str,
                 tp_price: float, sl_price: float) -> dict:
     """
@@ -126,29 +153,37 @@ def place_tp_sl(symbol: str, entry_side: str,
     entry_side SELL → closing side is BUY
     """
     close_side = "SELL" if entry_side == "BUY" else "BUY"
+    tick = get_tick_size(symbol)
     results = {}
+
+    # Small delay to ensure entry order is registered before placing conditionals
+    time.sleep(1)
 
     if tp_price > 0:
         results["tp"] = b_post("/fapi/v1/order", {
             "symbol":           symbol,
             "side":             close_side,
             "type":             "TAKE_PROFIT_MARKET",
-            "stopPrice":        str(round(tp_price, 8)),
+            "stopPrice":        round_price(tp_price, tick),
             "closePosition":    "true",
             "timeInForce":      "GTE_GTC",
+            "workingType":      "MARK_PRICE",
             "newClientOrderId": uuid.uuid4().hex[:32],
         })
+        print(f"[TP] {symbol} @ {round_price(tp_price, tick)} → {results['tp']}")
 
     if sl_price > 0:
         results["sl"] = b_post("/fapi/v1/order", {
             "symbol":           symbol,
             "side":             close_side,
             "type":             "STOP_MARKET",
-            "stopPrice":        str(round(sl_price, 8)),
+            "stopPrice":        round_price(sl_price, tick),
             "closePosition":    "true",
             "timeInForce":      "GTE_GTC",
+            "workingType":      "MARK_PRICE",
             "newClientOrderId": uuid.uuid4().hex[:32],
         })
+        print(f"[SL] {symbol} @ {round_price(sl_price, tick)} → {results['sl']}")
 
     return results
 
@@ -252,10 +287,5 @@ def debug():
             results[label] = {"exception": str(e)}
     return jsonify(results), 200
 
-@app.route("/myip", methods=["GET"])
-def myip():
-    r = requests.get("https://api.ipify.org?format=json", timeout=5)
-    return jsonify(r.json())
-    
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
