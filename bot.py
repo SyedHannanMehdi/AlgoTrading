@@ -5,13 +5,14 @@ import math
 import os
 import uuid
 import json
+import threading
 import requests
 from urllib.parse import urlencode
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ─── CONFIG — set these as environment variables in Railway ───────────────────
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
 API_KEY        = os.environ.get("BINANCE_API_KEY",    "")
 SECRET_KEY     = os.environ.get("BINANCE_SECRET_KEY", "")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET",     "")
@@ -20,11 +21,10 @@ MARGIN_PCT      = float(os.environ.get("MARGIN_PCT",      "0.20"))
 LEVERAGE        = int(os.environ.get("LEVERAGE",          "10"))
 MAX_OPEN_TRADES = int(os.environ.get("MAX_OPEN_TRADES",   "5"))
 
-BASE_URL = "https://fapi.binance.com"  # USDM Futures
+BASE_URL = "https://fapi.binance.com"
 
-# ─── SYMBOL MAP — TradingView ticker → Binance USDM symbol ───────────────────
+# ─── SYMBOL MAP ───────────────────────────────────────────────────────────────
 SYMBOL_MAP = {
-    # Crypto.com feed → Binance equivalent
     "GUNUSD":      "GUNUSDT",
     "PIPPINUSD":   "PIPPINUSDT",
     "RIVERUSD":    "RIVERUSDT",
@@ -35,7 +35,6 @@ SYMBOL_MAP = {
     "SPX6USD":     "SPX6900USDT",
     "RESOLVUSD":   "RESOLVEUSDT",
     "API3USD":     "API3USDT",
-    # Binance feed — with and without .P suffix (TradingView adds .P for perps)
     "BIOUSDT":     "BIOUSDT",
     "BIOUSDT.P":   "BIOUSDT",
     "THEUSDT":     "THEUSDT",
@@ -48,39 +47,56 @@ SYMBOL_MAP = {
     "PUMPUSDT.P":  "PUMPUSDT",
 }
 
+# ─── EXCHANGE INFO CACHE ──────────────────────────────────────────────────────
+_exchange_info = {}
+
+def load_exchange_info():
+    global _exchange_info
+    try:
+        info = requests.get(f"{BASE_URL}/fapi/v1/exchangeInfo", timeout=10).json()
+        for s in info.get("symbols", []):
+            sym = s["symbol"]
+            tick = 0.0001
+            step = 0.1
+            for f in s.get("filters", []):
+                if f["filterType"] == "PRICE_FILTER":
+                    tick = float(f["tickSize"])
+                elif f["filterType"] == "LOT_SIZE":
+                    step = float(f["stepSize"])
+            _exchange_info[sym] = {"tick": tick, "step": step}
+        print(f"[INIT] Exchange info loaded for {len(_exchange_info)} symbols")
+    except Exception as e:
+        print(f"[INIT] Failed to load exchange info: {e}")
+
+load_exchange_info()
+
+def get_tick(symbol): return _exchange_info.get(symbol, {}).get("tick", 0.0001)
+def get_step(symbol): return _exchange_info.get(symbol, {}).get("step", 0.1)
+
 # ─── SIGNATURE ────────────────────────────────────────────────────────────────
-# Binance: HMAC-SHA256 over the full query string including timestamp
-def _sign(params: dict) -> dict:
+def _sign(params):
     params["timestamp"] = int(time.time() * 1000)
-    query_string = urlencode(params)
-    params["signature"] = hmac.new(
-        SECRET_KEY.encode("utf-8"),
-        query_string.encode("utf-8"),
-        hashlib.sha256
-    ).hexdigest()
+    qs = urlencode(params)
+    params["signature"] = hmac.new(SECRET_KEY.encode(), qs.encode(), hashlib.sha256).hexdigest()
     return params
 
-def _headers() -> dict:
-    return {"X-MBX-APIKEY": API_KEY}
+def _headers(): return {"X-MBX-APIKEY": API_KEY}
 
-def b_get(path: str, params: dict = None) -> dict:
-    r = requests.get(BASE_URL + path, headers=_headers(),
-                     params=_sign(params or {}), timeout=10)
+def b_get(path, params=None):
+    r = requests.get(BASE_URL + path, headers=_headers(), params=_sign(params or {}), timeout=10)
     return r.json()
 
-def b_post(path: str, params: dict) -> dict:
-    r = requests.post(BASE_URL + path, headers=_headers(),
-                      params=_sign(params), timeout=10)
+def b_post(path, params):
+    r = requests.post(BASE_URL + path, headers=_headers(), params=_sign(params), timeout=10)
     return r.json()
 
-# ─── ACCOUNT BALANCE ─────────────────────────────────────────────────────────
-def get_balance() -> float:
-    """GET /fapi/v3/balance → available USDT"""
+# ─── ACCOUNT ─────────────────────────────────────────────────────────────────
+def get_balance():
     try:
         resp = b_get("/fapi/v3/balance")
-        for asset in (resp if isinstance(resp, list) else []):
-            if asset.get("asset") == "USDT":
-                bal = float(asset.get("availableBalance", 0))
+        for a in (resp if isinstance(resp, list) else []):
+            if a.get("asset") == "USDT":
+                bal = float(a.get("availableBalance", 0))
                 print(f"[ACCOUNT] Balance: ${bal:.2f}")
                 return bal
         print(f"[ACCOUNT] Unexpected: {resp}")
@@ -89,116 +105,71 @@ def get_balance() -> float:
         print(f"[ACCOUNT] Error: {e}")
         return 0.0
 
-# ─── OPEN POSITIONS ───────────────────────────────────────────────────────────
-def get_open_positions() -> list:
-    """GET /fapi/v3/positionRisk → non-zero positions"""
+def get_open_positions():
     try:
         resp = b_get("/fapi/v3/positionRisk")
-        return [p for p in (resp if isinstance(resp, list) else [])
-                if float(p.get("positionAmt", 0)) != 0]
+        return [p for p in (resp if isinstance(resp, list) else []) if float(p.get("positionAmt", 0)) != 0]
     except Exception as e:
         print(f"[POSITIONS] Error: {e}")
         return []
 
-# ─── LEVERAGE & MARGIN MODE ───────────────────────────────────────────────────
-def set_leverage_isolated(symbol: str):
+# ─── LEVERAGE ─────────────────────────────────────────────────────────────────
+def set_leverage_isolated(symbol):
     try:
-        r1 = b_post("/fapi/v1/leverage",    {"symbol": symbol, "leverage": LEVERAGE})
-        r2 = b_post("/fapi/v1/marginType",  {"symbol": symbol, "marginType": "ISOLATED"})
+        r1 = b_post("/fapi/v1/leverage",   {"symbol": symbol, "leverage": LEVERAGE})
+        r2 = b_post("/fapi/v1/marginType", {"symbol": symbol, "marginType": "ISOLATED"})
         print(f"[LEVERAGE] {symbol} {LEVERAGE}x isolated | {r1.get('msg','ok')} | {r2.get('msg','ok')}")
     except Exception as e:
         print(f"[LEVERAGE] Error: {e}")
 
-# ─── PLACE MARKET ENTRY ───────────────────────────────────────────────────────
-def place_entry(symbol: str, side: str, qty: float) -> dict:
-    """POST /fapi/v1/order — MARKET, one-way mode (positionSide=BOTH)"""
+# ─── HELPERS ──────────────────────────────────────────────────────────────────
+def round_price(price, tick):
+    if tick <= 0: return str(round(price, 4))
+    precision = max(0, round(-math.log10(tick)))
+    return f"{math.floor(price / tick) * tick:.{int(precision)}f}"
+
+def calc_qty(symbol, price, balance):
+    if price <= 0 or balance <= 0: return 0.0
+    raw = (balance * MARGIN_PCT * LEVERAGE) / price
+    step = get_step(symbol)
+    if step <= 0: return math.floor(raw * 10) / 10
+    precision = max(0, round(-math.log10(step)))
+    return round(math.floor(raw / step) * step, int(precision))
+
+# ─── ORDERS ───────────────────────────────────────────────────────────────────
+def place_entry(symbol, side, qty):
     return b_post("/fapi/v1/order", {
-        "symbol":           symbol,
-        "side":             side,       # BUY or SELL
-        "type":             "MARKET",
-        "quantity":         str(qty),
-        "newClientOrderId": uuid.uuid4().hex[:32],
+        "symbol": symbol, "side": side, "type": "MARKET",
+        "quantity": str(qty), "newClientOrderId": uuid.uuid4().hex[:32],
     })
 
-# ─── PRICE PRECISION ─────────────────────────────────────────────────────────
-_tick_cache = {}
-
-def get_tick_size(symbol: str) -> float:
-    """Fetch Binance tick size (price precision) for a symbol. Cached."""
-    if symbol in _tick_cache:
-        return _tick_cache[symbol]
-    try:
-        info = requests.get(f"{BASE_URL}/fapi/v1/exchangeInfo", timeout=10).json()
-        for s in info.get("symbols", []):
-            if s["symbol"] == symbol:
-                for f in s.get("filters", []):
-                    if f["filterType"] == "PRICE_FILTER":
-                        tick = float(f["tickSize"])
-                        _tick_cache[symbol] = tick
-                        return tick
-    except Exception as e:
-        print(f"[TICK] Error fetching tick size for {symbol}: {e}")
-    return 0.0001  # safe fallback
-
-def round_price(price: float, tick: float) -> str:
-    """Round price to Binance tick size and return as string."""
-    if tick <= 0:
-        return str(round(price, 4))
-    precision = max(0, round(-math.log10(tick)))
-    rounded = math.floor(price / tick) * tick
-    return f"{rounded:.{int(precision)}f}"
-
-# ─── PLACE TP + SL (separate orders, post Dec-2025 Binance API) ──────────────
-# STOP_MARKET and TAKE_PROFIT_MARKET use closePosition=true + workingType=MARK_PRICE
-def place_tp_sl(symbol: str, entry_side: str,
-                tp_price: float, sl_price: float) -> dict:
-    """
-    Places TP and SL as separate conditional orders.
-    entry_side BUY  → closing side is SELL
-    entry_side SELL → closing side is BUY
-    """
+def place_tp_sl(symbol, entry_side, tp_price, sl_price):
+    """Runs in background thread — places TP/SL after entry settles."""
     close_side = "SELL" if entry_side == "BUY" else "BUY"
-    tick = get_tick_size(symbol)
-    results = {}
-
-    # Small delay to ensure entry order is registered before placing conditionals
+    tick = get_tick(symbol)
     time.sleep(1)
 
     if tp_price > 0:
-        results["tp"] = b_post("/fapi/v1/order", {
-            "symbol":           symbol,
-            "side":             close_side,
-            "type":             "TAKE_PROFIT_MARKET",
-            "stopPrice":        round_price(tp_price, tick),
-            "closePosition":    "true",
-            "timeInForce":      "GTE_GTC",
-            "workingType":      "MARK_PRICE",
+        r = b_post("/fapi/v1/order", {
+            "symbol": symbol, "side": close_side,
+            "type": "TAKE_PROFIT_MARKET",
+            "stopPrice": round_price(tp_price, tick),
+            "closePosition": "true", "timeInForce": "GTE_GTC",
+            "workingType": "MARK_PRICE",
             "newClientOrderId": uuid.uuid4().hex[:32],
         })
-        print(f"[TP] {symbol} @ {round_price(tp_price, tick)} → {results['tp']}")
+        print(f"[TP] {symbol} @ {round_price(tp_price, tick)} → {r}")
 
     if sl_price > 0:
-        results["sl"] = b_post("/fapi/v1/order", {
-            "symbol":           symbol,
-            "side":             close_side,
-            "type":             "STOP_MARKET",
-            "stopPrice":        round_price(sl_price, tick),
-            "closePosition":    "true",
-            "timeInForce":      "GTE_GTC",
-            "workingType":      "MARK_PRICE",
+        r = b_post("/fapi/v1/order", {
+            "symbol": symbol, "side": close_side,
+            "type": "STOP_MARKET",
+            "stopPrice": round_price(sl_price, tick),
+            "closePosition": "true", "timeInForce": "GTE_GTC",
+            "workingType": "MARK_PRICE",
             "newClientOrderId": uuid.uuid4().hex[:32],
         })
-        print(f"[SL] {symbol} @ {round_price(sl_price, tick)} → {results['sl']}")
-
-    return results
-
-# ─── QUANTITY CALC ────────────────────────────────────────────────────────────
-def calc_qty(price: float, balance: float) -> float:
-    """notional = balance × margin% × leverage → qty = notional / price"""
-    if price <= 0 or balance <= 0:
-        return 0.0
-    notional = balance * MARGIN_PCT * LEVERAGE
-    return math.floor((notional / price) * 10) / 10  # 1 decimal, round down
+        print(f"[SL] {symbol} @ {round_price(sl_price, tick)} → {r}")
 
 # ─── WEBHOOK ──────────────────────────────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
@@ -206,7 +177,6 @@ def webhook():
     data = request.get_json(force=True)
     if not data:
         return jsonify({"error": "empty body"}), 400
-
     if request.args.get("secret") != WEBHOOK_SECRET:
         return jsonify({"error": "unauthorized"}), 401
 
@@ -231,38 +201,32 @@ def webhook():
 
     open_positions = get_open_positions()
     if len(open_positions) >= MAX_OPEN_TRADES:
-        print(f"[SKIP] Max trades: {len(open_positions)}/{MAX_OPEN_TRADES}")
         return jsonify({"status": "skipped", "reason": "max_open_trades"}), 200
 
-    open_symbols = [p.get("symbol") for p in open_positions]
-    if symbol in open_symbols:
-        print(f"[SKIP] Already in {symbol}")
+    if symbol in [p.get("symbol") for p in open_positions]:
         return jsonify({"status": "skipped", "reason": "already_open"}), 200
 
     set_leverage_isolated(symbol)
 
-    qty = calc_qty(price, balance)
+    qty = calc_qty(symbol, price, balance)
     if qty <= 0:
-        return jsonify({"error": "quantity is zero — check balance/price"}), 400
+        return jsonify({"error": "quantity is zero"}), 400
 
+    # Entry order — synchronous
     entry_result = place_entry(symbol, side, qty)
-    tp_sl_result = place_tp_sl(symbol, side, tp_price, sl_price) if (tp_price > 0 or sl_price > 0) else {}
+    print(f"[ENTRY] {side} {qty} {symbol} @ ~{price} → {entry_result}")
 
-    log = {
-        "status":   "ok",
-        "side":     side,
-        "symbol":   symbol,
-        "price":    price,
-        "tp":       tp_price,
-        "sl":       sl_price,
-        "qty":      qty,
-        "balance":  balance,
+    # TP/SL — background thread so response returns before TradingView 5s timeout
+    if tp_price > 0 or sl_price > 0:
+        threading.Thread(target=place_tp_sl, args=(symbol, side, tp_price, sl_price), daemon=True).start()
+
+    return jsonify({
+        "status": "ok", "side": side, "symbol": symbol,
+        "price": price, "tp": tp_price, "sl": sl_price,
+        "qty": qty, "balance": balance,
         "notional": round(balance * MARGIN_PCT * LEVERAGE, 2),
-        "entry":    entry_result,
-        "tp_sl":    tp_sl_result,
-    }
-    print(f"[ORDER] {json.dumps(log)}")
-    return jsonify(log), 200
+        "entry": entry_result,
+    }), 200
 
 # ─── HEALTH ───────────────────────────────────────────────────────────────────
 @app.route("/", methods=["GET"])
@@ -270,26 +234,18 @@ def health():
     balance   = get_balance()
     positions = get_open_positions()
     return jsonify({
-        "status":      "running",
-        "exchange":    "Binance USDM Futures",
-        "balance":     balance,
-        "open_trades": len(positions),
-        "max_trades":  MAX_OPEN_TRADES,
-        "leverage":    LEVERAGE,
-        "margin_pct":  MARGIN_PCT,
-        "positions":   [p.get("symbol") for p in positions],
+        "status": "running", "exchange": "Binance USDM Futures",
+        "balance": balance, "open_trades": len(positions),
+        "max_trades": MAX_OPEN_TRADES, "leverage": LEVERAGE,
+        "margin_pct": MARGIN_PCT,
+        "positions": [p.get("symbol") for p in positions],
     }), 200
 
 # ─── DEBUG ────────────────────────────────────────────────────────────────────
 @app.route("/debug", methods=["GET"])
 def debug():
-    """Returns raw Binance responses — no processing, shows exact errors."""
     results = {}
-    for label, path in [
-        ("balance",   "/fapi/v3/balance"),
-        ("account",   "/fapi/v3/account"),
-        ("positions", "/fapi/v3/positionRisk"),
-    ]:
+    for label, path in [("balance", "/fapi/v3/balance"), ("account", "/fapi/v3/account"), ("positions", "/fapi/v3/positionRisk")]:
         try:
             results[label] = b_get(path)
         except Exception as e:
