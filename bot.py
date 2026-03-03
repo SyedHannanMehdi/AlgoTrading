@@ -35,12 +35,17 @@ SYMBOL_MAP = {
     "SPX6USD":     "SPX6900USDT",
     "RESOLVUSD":   "RESOLVEUSDT",
     "API3USD":     "API3USDT",
-    # Binance feed — already correct
+    # Binance feed — with and without .P suffix (TradingView adds .P for perps)
     "BIOUSDT":     "BIOUSDT",
+    "BIOUSDT.P":   "BIOUSDT",
     "THEUSDT":     "THEUSDT",
+    "THEUSDT.P":   "THEUSDT",
     "PENGUUSDT":   "PENGUUSDT",
+    "PENGUUSDT.P": "PENGUUSDT",
     "AEROUSDT":    "AEROUSDT",
+    "AEROUSDT.P":  "AEROUSDT",
     "PUMPUSDT":    "PUMPUSDT",
+    "PUMPUSDT.P":  "PUMPUSDT",
 }
 
 # ─── SIGNATURE ────────────────────────────────────────────────────────────────
