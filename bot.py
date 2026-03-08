@@ -33,7 +33,7 @@ SYMBOL_MAP = {
     "USUALUSD":    "USUALUSDT",
     "BROCCOLIUSD": "BROCCOLIUSDT",
     "SPX6USD":     "SPX6900USDT",
-    "RESOLVUSD":   "RESOLVEUSDT",
+    "RESOLVUSD":   "RESOLVUSDT",
     "API3USD":     "API3USDT",
     "BIOUSDT":     "BIOUSDT",
     "BIOUSDT.P":   "BIOUSDT",
@@ -144,13 +144,15 @@ def place_entry(symbol, side, qty):
     })
 
 def place_tp_sl(symbol, entry_side, tp_price, sl_price):
-    """Runs in background thread — places TP/SL after entry settles."""
+    """Runs in background thread — places TP/SL after entry settles.
+    Uses /fapi/v1/algoOrder (required since Binance Dec 2025 migration).
+    """
     close_side = "SELL" if entry_side == "BUY" else "BUY"
     tick = get_tick(symbol)
     time.sleep(1)
 
     if tp_price > 0:
-        r = b_post("/fapi/v1/order", {
+        r = b_post("/fapi/v1/algoOrder", {
             "symbol": symbol, "side": close_side,
             "type": "TAKE_PROFIT_MARKET",
             "stopPrice": round_price(tp_price, tick),
@@ -161,7 +163,7 @@ def place_tp_sl(symbol, entry_side, tp_price, sl_price):
         print(f"[TP] {symbol} @ {round_price(tp_price, tick)} → {r}")
 
     if sl_price > 0:
-        r = b_post("/fapi/v1/order", {
+        r = b_post("/fapi/v1/algoOrder", {
             "symbol": symbol, "side": close_side,
             "type": "STOP_MARKET",
             "stopPrice": round_price(sl_price, tick),
