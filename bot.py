@@ -45,6 +45,19 @@ SYMBOL_MAP = {
     "AEROUSDT.P":  "AEROUSDT",
     "PUMPUSDT":    "PUMPUSDT",
     "PUMPUSDT.P":  "PUMPUSDT",
+    # New coins
+    "XNYUSDT":     "XNYUSDT",
+    "XNYUSDT.P":   "XNYUSDT",
+    "QUSDT":       "QUSDT",
+    "QUSDT.P":     "QUSDT",
+    "LYNUSDT":     "LYNUSDT",
+    "LYNUSDT.P":   "LYNUSDT",
+    "BEATUSDT":    "BEATUSDT",
+    "BEATUSDT.P":  "BEATUSDT",
+    "SIRENUSDT":   "SIRENUSDT",
+    "SIRENUSDT.P": "SIRENUSDT",
+    "BANANAS31USDT":   "BANANAS31USDT",
+    "BANANAS31USDT.P": "BANANAS31USDT",
 }
 
 # ─── EXCHANGE INFO CACHE ──────────────────────────────────────────────────────
